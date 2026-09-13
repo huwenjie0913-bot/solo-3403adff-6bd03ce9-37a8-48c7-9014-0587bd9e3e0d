@@ -13,17 +13,51 @@ const SENS = {
   insensitive: { lux_limit: 300, dose_limit: 1e12 },
 };
 
+// 相机画幅预设（传感器宽×高，mm）
+const SENSORS = {
+  full: [36, 24],
+  apsc: [23.6, 15.6],
+  m43: [17.3, 13],
+  mf: [44, 33],
+};
+
+// 展柜各反射面的默认光学参数（与后端 physics.REFL_DEFAULTS 一致）
+const SURF_DEFAULTS = {
+  bottom: { reflectance: 0.5, roughness: 0.15 },
+  back: { reflectance: 0.4, roughness: 0.2 },
+  glass: { reflectance: 0.08, roughness: 0.03 },
+};
+
 const state = {
-  config: defaultConfig(),
+  config: normalizeConfig(defaultConfig()),
   view: { scale: 70, ox: 80, oy: 60 },
   selected: null,        // 设备对象或 'camera'
   result: null,
   trace: null,           // {surface, index}
+  spotSel: null,         // 选中的反射光斑
   schemes: [],
   overlayConfig: null,   // 方案 B 叠加
   showHeat: true,
+  showFov: true,
+  showRefl: true,
   idSeq: 1,
 };
+
+// 兼容旧方案：补齐相机朝向/焦距/画幅与展柜反射面参数
+function normalizeConfig(cfg) {
+  cfg.camera = Object.assign(
+    { x: 5, y: 1.2, z: 1.6, yaw: 90, pitch: -8, focal: 35, sensor_w: 36, sensor_h: 24, locked: false },
+    cfg.camera || {});
+  for (const d of cfg.devices || []) {
+    if (d.type === 'case') {
+      d.surf = d.surf || {};
+      for (const p of ['bottom', 'back', 'glass']) {
+        d.surf[p] = Object.assign({ ...SURF_DEFAULTS[p] }, d.surf[p] || {});
+      }
+    }
+  }
+  return cfg;
+}
 
 function defaultConfig() {
   return {
@@ -33,10 +67,12 @@ function defaultConfig() {
       hours_per_day: 8, grid: 0.25, sensitivity: 'paper',
       lux_limit: 50, dose_limit: 120000, glare_limit: 25,
     },
-    camera: { x: 5, y: 1.2, z: 1.6 },
+    camera: { x: 5, y: 1.2, z: 1.6, yaw: 90, pitch: -8, focal: 35,
+              sensor_w: 36, sensor_h: 24, locked: false },
     devices: [
       { id: 'case1', type: 'case', name: '展柜A', x: 5, y: 4, w: 2.4, d: 1.2, h: 2.2,
-        rot: 0, opaque: false, transmission: 0.9 },
+        rot: 0, opaque: false, transmission: 0.9,
+        surf: JSON.parse(JSON.stringify(SURF_DEFAULTS)) },
       { id: 'bg1', type: 'background', name: '背景板', x: 5, y: 5.4, w: 3, d: 0.12,
         h: 2.6, rot: 0, opaque: true },
       { id: 'lamp1', type: 'lamp', name: '灯1', x: 3.6, y: 2.6, z: 3, power: 35,
@@ -105,21 +141,30 @@ function draw() {
   // 设备
   for (const d of state.config.devices) drawDevice(d, false);
 
-  // 相机
+  // 相机（含视场扇形，图标指向朝向）
   const cam = state.config.camera;
   if (cam) {
+    if (state.showFov) drawFov(cam);
     const [cx, cy] = w2s(cam.x, cam.y);
+    const yaw = (cam.yaw == null ? 90 : cam.yaw) * Math.PI / 180;
+    const dx = Math.cos(yaw), dy = -Math.sin(yaw);   // 屏幕系朝向
+    const px = -dy, py = dx;
     ctx.fillStyle = state.selected === 'camera' ? '#059669' : '#10b981';
     ctx.beginPath();
-    ctx.moveTo(cx, cy - 9); ctx.lineTo(cx + 8, cy + 6); ctx.lineTo(cx - 8, cy + 6);
+    ctx.moveTo(cx + dx * 11, cy + dy * 11);
+    ctx.lineTo(cx - dx * 6 + px * 7, cy - dy * 6 + py * 7);
+    ctx.lineTo(cx - dx * 6 - px * 7, cy - dy * 6 - py * 7);
     ctx.closePath(); ctx.fill();
     ctx.fillStyle = '#065f46';
     ctx.font = '10px sans-serif';
-    ctx.fillText('相机', cx + 10, cy + 4);
+    ctx.fillText(`相机 ${cam.focal || 35}mm${cam.locked ? ' 🔒' : ''}`, cx + 10, cy + 4);
   }
 
   // 热区
   if (state.showHeat && state.result) drawHeat();
+
+  // 反射光路与光斑
+  if (state.showRefl && state.result) drawReflections();
 
   // 追溯点高亮
   if (state.trace && state.result) {
@@ -137,6 +182,80 @@ function draw() {
 
 function line(a, b) {
   ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+}
+
+// 射线与房间矩形求交，返回最近正向距离（用于视场边界）
+function rayRoom(x, y, dx, dy, w, h) {
+  let t = 1e9;
+  if (dx > 1e-9) t = Math.min(t, (w - x) / dx);
+  else if (dx < -1e-9) t = Math.min(t, -x / dx);
+  if (dy > 1e-9) t = Math.min(t, (h - y) / dy);
+  else if (dy < -1e-9) t = Math.min(t, -y / dy);
+  return Math.max(t, 0);
+}
+
+// 镜头视场扇形（水平张角，裁剪到房间边界）
+function drawFov(cam) {
+  const hfov = 2 * Math.atan((cam.sensor_w || 36) / (2 * (cam.focal || 35)));
+  const yaw = (cam.yaw == null ? 90 : cam.yaw) * Math.PI / 180;
+  const room = state.config.room;
+  const [cx, cy] = w2s(cam.x, cam.y);
+  const pts = [];
+  for (const sgn of [-1, 1]) {
+    const a = yaw + sgn * hfov / 2;
+    const t = rayRoom(cam.x, cam.y, Math.cos(a), Math.sin(a), room.w, room.h);
+    pts.push(w2s(cam.x + Math.cos(a) * t, cam.y + Math.sin(a) * t));
+  }
+  ctx.save();
+  ctx.fillStyle = 'rgba(16,185,129,0.07)';
+  ctx.strokeStyle = 'rgba(5,150,105,0.65)';
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(pts[0][0], pts[0][1]);
+  ctx.lineTo(pts[1][0], pts[1][1]);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+// 反射光路（红实线=入画，灰虚线=视场外）与光斑范围
+function drawReflections() {
+  const refl = state.result.reflections;
+  if (!refl || !refl.spots) return;
+  const sc = state.view.scale;
+  for (const sp of refl.spots) {
+    const p = sp.path;
+    const a = w2s(p.lamp.x, p.lamp.y), b = w2s(p.hit.x, p.hit.y), c = w2s(p.cam.x, p.cam.y);
+    ctx.strokeStyle = sp.in_frame ? 'rgba(220,38,38,0.8)' : 'rgba(148,163,184,0.7)';
+    ctx.lineWidth = sp.in_frame ? 1.6 : 1.1;
+    ctx.setLineDash(sp.in_frame ? [] : [5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.lineTo(c[0], c[1]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // 光斑（竖直面沿法线外移，与热区点一致）
+    const n = sp.normal || [0, 0, 0];
+    const off = sp.plane === 'bottom' ? 0 : 0.12;
+    const [px, py] = w2s(sp.hit.x + n[0] * off, sp.hit.y + n[1] * off);
+    ctx.fillStyle = sp.in_frame ? 'rgba(220,38,38,0.3)' : 'rgba(148,163,184,0.3)';
+    ctx.strokeStyle = sp.in_frame ? '#dc2626' : '#94a3b8';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    if (sp.plane === 'bottom' && sp.spot.axis) {
+      const rot = -Math.atan2(sp.spot.axis[1], sp.spot.axis[0]);
+      ctx.ellipse(px, py, clamp(sp.spot.rx * sc, 3, 30), clamp(sp.spot.ry * sc, 2, 30),
+                  rot, 0, Math.PI * 2);
+    } else {
+      ctx.arc(px, py, clamp(sp.spot.ry * sc, 3, 24), 0, Math.PI * 2);
+    }
+    ctx.fill(); ctx.stroke();
+    if (state.spotSel === sp) {
+      ctx.strokeStyle = '#7c3aed';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, 12, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
 }
 
 function drawDevice(d, ghost) {
@@ -251,6 +370,20 @@ function pickHeat(wx, wy) {
   return best;
 }
 
+// 反射光斑拾取（与绘制位置一致：竖直面沿法线外移）
+function pickSpot(wx, wy) {
+  const refl = state.result && state.result.reflections;
+  if (!state.showRefl || !refl || !refl.spots) return null;
+  let best = null, bestD = 0.25;
+  for (const sp of refl.spots) {
+    const n = sp.normal || [0, 0, 0];
+    const off = sp.plane === 'bottom' ? 0 : 0.12;
+    const dd = Math.hypot(wx - (sp.hit.x + n[0] * off), wy - (sp.hit.y + n[1] * off));
+    if (dd < bestD) { bestD = dd; best = sp; }
+  }
+  return best;
+}
+
 /* ---------- 交互 ---------- */
 let drag = null;
 
@@ -261,23 +394,27 @@ canvas.addEventListener('pointerdown', e => {
     drag = { type: 'pan', sx: e.clientX, sy: e.clientY, ox: state.view.ox, oy: state.view.oy };
     return;
   }
-  // 命中优先级：灯具/相机（可拖放） > 网格热区（追溯） > 展柜/背景容器 > 平移
+  // 命中优先级：灯具/相机（可拖放） > 反射光斑 > 网格热区（追溯） > 展柜/背景容器 > 平移
   const pd = pickPointDevice(wx, wy);
   if (pd) {
     select(pd);
-    const locked = pd !== 'camera' && pd.type === 'lamp' && pd.locked;
+    const locked = pd === 'camera' ? !!state.config.camera.locked : !!pd.locked;
     if (!locked) {
       const src = pd === 'camera' ? state.config.camera : pd;
       drag = { type: 'move', dev: pd, dx: wx - src.x, dy: wy - src.y, moved: false };
     }
     return;
   }
+  const sp = pickSpot(wx, wy);
+  if (sp) { state.spotSel = sp; renderSpotDetail(sp); draw(); return; }
   const hp = pickHeat(wx, wy);
   if (hp) { doTrace(hp.surface, hp.index); return; }
   const rd = pickRectDevice(wx, wy);
   if (rd) {
     select(rd);
-    drag = { type: 'move', dev: rd, dx: wx - rd.x, dy: wy - rd.y, moved: false };
+    if (!rd.locked) {
+      drag = { type: 'move', dev: rd, dx: wx - rd.x, dy: wy - rd.y, moved: false };
+    }
     return;
   }
   select(null);
@@ -350,13 +487,23 @@ function select(d) {
 const FIELDS = {
   common: [['name', '名称', 'text'], ['x', 'X (m)', 0.1], ['y', 'Y (m)', 0.1]],
   case: [['w', '宽 (m)', 0.1], ['d', '深 (m)', 0.1], ['h', '高 (m)', 0.1],
-         ['rot', '旋转 (°)', 5], ['transmission', '玻璃透过率', 0.05]],
+         ['rot', '旋转 (°)', 5], ['transmission', '玻璃透过率', 0.05],
+         ['surf.bottom.reflectance', '展台面反射率', 0.05],
+         ['surf.bottom.roughness', '展台面粗糙度', 0.05],
+         ['surf.back.reflectance', '背板反射率', 0.05],
+         ['surf.back.roughness', '背板粗糙度', 0.05],
+         ['surf.glass.reflectance', '玻璃反射率', 0.02],
+         ['surf.glass.roughness', '玻璃粗糙度', 0.02]],
   background: [['w', '宽 (m)', 0.1], ['d', '厚 (m)', 0.02], ['h', '高 (m)', 0.1],
                ['rot', '旋转 (°)', 5]],
   lamp: [['z', '安装高度 (m)', 0.1], ['power', '功率 (W)', 1], ['cct', '色温 (K)', 100],
          ['beam', '光束角 (°)', 1], ['efficacy', '光效 (lm/W)', 5],
          ['aim.x', '瞄准点 X', 0.1], ['aim.y', '瞄准点 Y', 0.1], ['aim.z', '瞄准点 Z', 0.1]],
-  camera: [['z', '眼位高度 (m)', 0.1]],
+};
+
+// 画幅预设（传感器宽×高，mm）
+const SENSOR_PRESETS = {
+  full: [36, 24], apsc: [23.6, 15.6], m43: [17.3, 13], mf: [44, 33],
 };
 
 function renderProps() {
@@ -365,9 +512,41 @@ function renderProps() {
   if (!d) { body.innerHTML = '<span class="muted">未选中设备（点击画布中的设备）</span>'; return; }
   if (d === 'camera') {
     const cam = state.config.camera;
-    body.innerHTML = `<div class="props"><h3>相机</h3>${fieldHtml('x', 'X (m)', cam.x, 0.1)}
-      ${fieldHtml('y', 'Y (m)', cam.y, 0.1)}${fieldHtml('z', '眼位高度 (m)', cam.z, 0.1)}</div>`;
+    const hfov = 2 * Math.atan((cam.sensor_w || 36) / (2 * (cam.focal || 35))) * 180 / Math.PI;
+    const vfov = 2 * Math.atan((cam.sensor_h || 24) / (2 * (cam.focal || 35))) * 180 / Math.PI;
+    const curSensor = Object.keys(SENSOR_PRESETS).find(k =>
+      SENSOR_PRESETS[k][0] === cam.sensor_w && SENSOR_PRESETS[k][1] === cam.sensor_h) || '';
+    body.innerHTML = `<div class="props"><h3>相机${cam.locked ? ' 🔒' : ''}</h3>
+      ${fieldHtml('x', 'X (m)', cam.x, 0.1)}
+      ${fieldHtml('y', 'Y (m)', cam.y, 0.1)}
+      ${fieldHtml('z', '眼位高度 (m)', cam.z, 0.1)}
+      ${fieldHtml('yaw', '朝向 (°，0=+X 90=+Y)', cam.yaw, 5)}
+      ${fieldHtml('pitch', '俯仰 (°，负=俯视)', cam.pitch, 1)}
+      ${fieldHtml('focal', '焦距 (mm)', cam.focal, 1)}
+      <label>画幅
+        <select data-sensor>
+          <option value="">自定义</option>
+          <option value="full">全画幅 36×24</option>
+          <option value="apsc">APS-C 23.6×15.6</option>
+          <option value="m43">4/3 17.3×13</option>
+          <option value="mf">中画幅 44×33</option>
+        </select>
+      </label>
+      ${fieldHtml('sensor_w', '传感器宽 (mm)', cam.sensor_w, 0.1)}
+      ${fieldHtml('sensor_h', '传感器高 (mm)', cam.sensor_h, 0.1)}
+      <div class="full muted">水平视场 ${hfov.toFixed(1)}° · 垂直视场 ${vfov.toFixed(1)}°</div>
+      <label class="full chk"><input type="checkbox" data-field="locked" ${cam.locked ? 'checked' : ''}> 锁定机位（试排灯具时不移动）</label>
+    </div>`;
     bindProps(cam);
+    const sel = body.querySelector('[data-sensor]');
+    sel.value = curSensor;
+    sel.addEventListener('change', () => {
+      const p = SENSOR_PRESETS[sel.value];
+      if (p) {
+        cam.sensor_w = p[0]; cam.sensor_h = p[1];
+        renderProps(); draw(); scheduleEvaluate();
+      }
+    });
     return;
   }
   let html = `<div class="props"><h3>${typeName(d.type)}${d.locked ? ' 🔒' : ''}</h3>`;
@@ -380,6 +559,7 @@ function renderProps() {
   }
   if (d.type === 'case' || d.type === 'background') {
     html += `<label class="full chk"><input type="checkbox" data-field="opaque" ${d.opaque ? 'checked' : ''}> 不透明（完全遮挡光线）</label>`;
+    html += `<label class="full chk"><input type="checkbox" data-field="locked" ${d.locked ? 'checked' : ''}> 锁定位置（试排其余设备时不移动）</label>`;
   }
   html += '</div>';
   body.innerHTML = html;
@@ -465,6 +645,8 @@ async function doEvaluate() {
   });
   state.result = await res.json();
   state.trace = null;
+  state.spotSel = null;
+  $('#spotBody').innerHTML = '<span class="muted">评估后点击画布中的光斑（红=入画，灰=视场外）</span>';
   renderResults();
   draw();
 }
@@ -495,6 +677,26 @@ function renderResults() {
   if (g.lamps.length) {
     html += '<div class="muted">可见灯具：' + g.lamps.map(l => `${esc(l.name)} ${l.ev} lx`).join('，') + '</div>';
   }
+  const rf = r.reflections;
+  if (rf) {
+    html += `<h4 class="sub">镜面反射（进镜头）</h4>`;
+    if (!rf.camera) {
+      html += '<div class="muted">未设置相机</div>';
+    } else {
+      const s = rf.summary;
+      html += `<div class="${s.in_frame ? 'warn' : 'ok'}">入画光斑 <b>${s.in_frame}</b> 个`
+        + `（反射光路共 ${s.total} 条）· 覆盖面积约 ${s.area} m²</div>`
+        + `<div class="muted">视场 ${rf.camera.hfov}° × ${rf.camera.vfov}°（${rf.camera.focal}mm · ${rf.camera.sensor_w}×${rf.camera.sensor_h}mm）</div>`;
+      if (s.worst) {
+        html += `<div>最严重来源：<b class="warn">${esc(s.worst.label)}</b>（反射强度 ${s.worst.severity}）</div>`;
+      }
+      if (rf.warnings.length) {
+        html += '<ul class="warns">' + rf.warnings.map(w => `<li>${esc(w)}</li>`).join('') + '</ul>';
+      } else if (!s.in_frame) {
+        html += '<div class="ok">当前机位无反射光路进入镜头 ✅</div>';
+      }
+    }
+  }
   $('#resultBody').innerHTML = html;
 }
 
@@ -520,6 +722,22 @@ async function doTrace(surface, index) {
   }
   $('#traceBody').innerHTML = html;
   draw();
+}
+
+/* ---------- 反射光斑详情 ---------- */
+function renderSpotDetail(sp) {
+  $('#spotBody').innerHTML = `
+    <div><b>${esc(sp.lamp_name)}</b> → ${esc(sp.surface_name)}
+      <span class="${sp.in_frame ? 'warn' : 'ok'}">${sp.in_frame ? ' ⚠ 入画' : '（视场外）'}</span></div>
+    <table>
+      <tr><td class="l">入射角 / 反射角</td><td>${sp.incident_deg}° / ${sp.reflect_deg}°</td></tr>
+      <tr><td class="l">命中点</td><td>(${sp.hit.x}, ${sp.hit.y}, z=${sp.hit.z})</td></tr>
+      <tr><td class="l">反射率 / 粗糙度</td><td>${sp.reflectance} / ${sp.roughness}</td></tr>
+      <tr><td class="l">光斑范围</td><td>${sp.spot.rx} × ${sp.spot.ry} m · ${sp.spot.area} m²</td></tr>
+      <tr><td class="l">偏轴角（水平/垂直）</td><td>${sp.off_h}° / ${sp.off_v}°</td></tr>
+      <tr><td class="l">命中点照度</td><td>${sp.E_hit} lx</td></tr>
+      <tr><td class="l">反射强度</td><td>${sp.severity}（照度×反射率）</td></tr>
+    </table>`;
 }
 
 /* ---------- 方案管理 ---------- */
@@ -550,9 +768,10 @@ $('#schemeList').addEventListener('click', async e => {
   const id = btn.dataset.id;
   if (btn.dataset.act === 'load') {
     const s = await (await fetch(`/api/schemes/${id}`)).json();
-    state.config = s.config;
+    state.config = normalizeConfig(s.config);
     state.selected = null;
     state.trace = null;
+    state.spotSel = null;
     loadSettingsToForm();
     renderProps();
     scheduleEvaluate();
@@ -603,9 +822,8 @@ $('#overlayToggle').addEventListener('change', async e => {
 });
 
 function fmtD(d, key) {
-  const cls = d > 0 ? 'bad-d' : d < 0 ? 'good-d' : '';
   // 对“越低越好”的指标反转颜色
-  const lowerBetter = ['E_max', 'shadow_rate', 'dose_year', 'dose_eff'];
+  const lowerBetter = ['E_max', 'shadow_rate', 'dose_year', 'dose_eff', 'refl_n', 'refl_area'];
   const good = lowerBetter.includes(key) ? d < 0 : d > 0;
   return `<td class="${d === 0 ? '' : good ? 'good-d' : 'bad-d'}">${d > 0 ? '+' : ''}${d}</td>`;
 }
@@ -621,6 +839,15 @@ function renderCompare(data) {
   }
   const g = data.diff.glare;
   html += `<h4 class="sub">眩光</h4><div>A ${g.a} lx → B ${g.b} lx（Δ ${g.d > 0 ? '+' : ''}${g.d}）</div>`;
+  const rf = data.diff.reflections;
+  if (rf) {
+    html += `<h4 class="sub">反射光斑（入画）</h4>
+      <table><tr><th class="l">指标</th><th>A</th><th>B</th><th>Δ</th></tr>
+      <tr><td class="l">光斑数量</td><td>${rf.in_frame.a}</td><td>${rf.in_frame.b}</td>${fmtD(rf.in_frame.d, 'refl_n')}</tr>
+      <tr><td class="l">覆盖面积 (m²)</td><td>${rf.area.a}</td><td>${rf.area.b}</td>${fmtD(rf.area.d, 'refl_area')}</tr>
+      <tr><td class="l">最严重来源</td><td colspan="3" class="l">${esc(rf.worst.a)} → ${esc(rf.worst.b)}</td></tr>
+      </table>`;
+  }
   $('#compareBody').innerHTML = html;
 }
 
@@ -634,7 +861,8 @@ function nextId(prefix) {
 $('#addCase').addEventListener('click', () => {
   const r = state.config.room;
   const d = { id: nextId('case'), type: 'case', name: '展柜' + state.idSeq,
-    x: r.w / 2, y: r.h / 2, w: 2, d: 1, h: 2.2, rot: 0, opaque: false, transmission: 0.9 };
+    x: r.w / 2, y: r.h / 2, w: 2, d: 1, h: 2.2, rot: 0, opaque: false, transmission: 0.9,
+    surf: JSON.parse(JSON.stringify(SURF_DEFAULTS)) };
   state.config.devices.push(d);
   select(d); scheduleEvaluate();
 });
@@ -696,6 +924,8 @@ function downloadBlob(blob, name) {
 
 /* ---------- 其它绑定 ---------- */
 $('#showHeat').addEventListener('change', e => { state.showHeat = e.target.checked; draw(); });
+$('#showFov').addEventListener('change', e => { state.showFov = e.target.checked; draw(); });
+$('#showRefl').addEventListener('change', e => { state.showRefl = e.target.checked; draw(); });
 $('#evalNow').addEventListener('click', doEvaluate);
 
 function esc(s) {

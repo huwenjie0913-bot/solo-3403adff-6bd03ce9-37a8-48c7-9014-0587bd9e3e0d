@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """把方案与评估结果渲染为带尺寸标注和告警的 SVG 图。"""
+import math
 from xml.sax.saxutils import escape
 
 S = 70  # 像素/米
@@ -38,6 +39,9 @@ def render_svg(config, m):
     if m['glare']['warning']:
         warn_lines.append('眩光：摄像机处垂直照度 %.1f lx 超过限值 %.0f lx'
                           % (m['glare']['total'], m['glare']['limit']))
+    refl = m.get('reflections') or {}
+    for w in refl.get('warnings') or []:
+        warn_lines.append(w)
     H = oy * 2 + rh * S + 40 + 18 * (len(warn_lines) + 1)
 
     def X(x):
@@ -117,10 +121,51 @@ def render_svg(config, m):
     cam = config.get('camera')
     if cam:
         cx, cy = X(cam['x']), Y(cam['y'])
+        # 镜头视场（水平张角，裁剪到房间边界）
+        yaw = math.radians(cam.get('yaw', 90))
+        focal = max(float(cam.get('focal', 35)), 1.0)
+        sw = max(float(cam.get('sensor_w', 36)), 1.0)
+        half = math.atan(sw / (2 * focal))
+        fov_pts = []
+        for sgn in (-1, 1):
+            a = yaw + sgn * half
+            dx, dy = math.cos(a), math.sin(a)
+            t = 1e9
+            if dx > 1e-9:
+                t = min(t, (rw - cam['x']) / dx)
+            elif dx < -1e-9:
+                t = min(t, -cam['x'] / dx)
+            if dy > 1e-9:
+                t = min(t, (rh - cam['y']) / dy)
+            elif dy < -1e-9:
+                t = min(t, -cam['y'] / dy)
+            t = max(t, 0.0)
+            fov_pts.append((X(cam['x'] + dx * t), Y(cam['y'] + dy * t)))
+        P.append('<path d="M %.1f %.1f L %.1f %.1f L %.1f %.1f Z" '
+                 'fill="rgba(16,185,129,0.08)" stroke="#059669" stroke-width="1" '
+                 'stroke-dasharray="5 4"/>'
+                 % (cx, cy, fov_pts[0][0], fov_pts[0][1], fov_pts[1][0], fov_pts[1][1]))
         P.append('<path d="M %.1f %.1f L %.1f %.1f L %.1f %.1f Z" fill="#10b981"/>'
                  % (cx, cy - 8, cx + 8, cy + 6, cx - 8, cy + 6))
-        P.append('<text x="%.1f" y="%.1f" font-size="10" fill="#065f46">相机</text>'
-                 % (cx + 10, cy + 4))
+        P.append('<text x="%.1f" y="%.1f" font-size="10" fill="#065f46">相机 %gmm</text>'
+                 % (cx + 10, cy + 4, focal))
+
+    # 反射光路（红=入画，灰虚线=视场外）与光斑范围
+    for sp in refl.get('spots') or []:
+        p = sp['path']
+        col = '#dc2626' if sp['in_frame'] else '#94a3b8'
+        dash = '' if sp['in_frame'] else ' stroke-dasharray="5 4"'
+        P.append('<polyline points="%.1f,%.1f %.1f,%.1f %.1f,%.1f" fill="none" '
+                 'stroke="%s" stroke-width="1.2"%s/>'
+                 % (X(p['lamp']['x']), Y(p['lamp']['y']),
+                    X(p['hit']['x']), Y(p['hit']['y']),
+                    X(p['cam']['x']), Y(p['cam']['y']), col, dash))
+        n = sp.get('normal') or [0, 0, 0]
+        off = 0 if sp['plane'] == 'bottom' else 8
+        px, py = X(sp['hit']['x']) + n[0] * off, Y(sp['hit']['y']) - n[1] * off
+        r = max(3.0, min(24.0, (sp['spot']['ry'] or 0) * S))
+        P.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" fill-opacity="0.3" '
+                 'stroke="%s"/>' % (px, py, r, col, col))
 
     # 热区标记（红=超上限/光敏阈值，橙=低于目标下限）
     for s in m['surfaces']:
@@ -142,6 +187,13 @@ def render_svg(config, m):
     P.append('<rect x="180" y="%.1f" width="12" height="12" fill="#f59e0b"/>'
              '<text x="198" y="%.1f" font-size="11" fill="#333">低于目标下限</text>'
              % (ly - 11, ly))
+    P.append('<line x1="330" y1="%.1f" x2="356" y2="%.1f" stroke="#dc2626" stroke-width="2"/>'
+             '<text x="362" y="%.1f" font-size="11" fill="#333">反射光路（入画）</text>'
+             % (ly - 5, ly - 5, ly))
+    P.append('<line x1="480" y1="%.1f" x2="506" y2="%.1f" stroke="#94a3b8" stroke-width="2" '
+             'stroke-dasharray="5 4"/>'
+             '<text x="512" y="%.1f" font-size="11" fill="#333">视场外光路</text>'
+             % (ly - 5, ly - 5, ly))
     ty = ly + 24
     P.append('<text x="20" y="%.1f" font-size="13" font-weight="bold" fill="#b91c1c">'
              '告警（%d）</text>' % (ty, len(warn_lines)))

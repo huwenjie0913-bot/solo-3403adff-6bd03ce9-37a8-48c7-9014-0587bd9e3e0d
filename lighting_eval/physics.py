@@ -7,7 +7,10 @@
 - 遮挡：在平面图上对“灯→采样点”线段与设备矩形求交（Liang–Barsky），
   相交处射线高度低于设备高度即被遮挡；不透明设备完全阻挡，玻璃展柜按透过率衰减；
 - 眩光：摄像机眼位处由可见灯具产生的垂直照度之和（简化指标）；
-- 光损伤：年累积剂量 lx·h，并按色温做蓝光危害加权（色温越高权重越大）。
+- 光损伤：年累积剂量 lx·h，并按色温做蓝光危害加权（色温越高权重越大）；
+- 镜面反射：每个展柜取展台面、背板、玻璃前表面三个一次反射面（记录法线、
+  粗糙度、反射率），用镜像法求“灯→面→镜头”光路，按反射定律核对入射/反射角；
+  粗糙度转为散射半角估算光斑范围，相机朝向/焦距/画幅决定是否入画。
 """
 import math
 
@@ -282,13 +285,16 @@ def evaluate(config):
         glare['lamps'].sort(key=lambda x: -x['ev'])
         glare['warning'] = glare['total'] > lim['glare_limit']
 
+    reflections = compute_reflections(config)
     summary = {
         'surfaces': len(out_surfaces),
-        'warnings': sum(len(s['warnings']) for s in out_surfaces) + (1 if glare['warning'] else 0),
+        'warnings': sum(len(s['warnings']) for s in out_surfaces)
+                    + (1 if glare['warning'] else 0) + len(reflections['warnings']),
         'avg_cct': round(avg_cct), 'damage_factor': round(dmg, 3),
         'limits': lim,
     }
-    return {'surfaces': out_surfaces, 'glare': glare, 'summary': summary}
+    return {'surfaces': out_surfaces, 'glare': glare,
+            'reflections': reflections, 'summary': summary}
 
 
 def trace_point(config, surface_id, index):
@@ -323,6 +329,223 @@ def trace_point(config, surface_id, index):
     }
 
 
+# ---------- 镜面反射试排 ----------
+
+# 各反射面的默认光学参数（可在展柜属性中按面调整）
+REFL_DEFAULTS = {
+    'bottom': {'reflectance': 0.5, 'roughness': 0.15},   # 展台面（玻璃压片/覆膜作品）
+    'back':   {'reflectance': 0.4, 'roughness': 0.2},    # 背板（覆膜挂画）
+    'glass':  {'reflectance': 0.08, 'roughness': 0.03},  # 展柜玻璃前表面
+}
+PLANE_LABEL = {'bottom': '展台面', 'back': '背板', 'glass': '玻璃'}
+
+
+def _vsub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vdot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vlen(a):
+    return math.sqrt(_vdot(a, a))
+
+
+def _vnorm(a):
+    n = _vlen(a)
+    return (a[0] / n, a[1] / n, a[2] / n) if n > 1e-12 else (0.0, 0.0, 0.0)
+
+
+def reflective_surfaces(config):
+    """每个展柜的三个一次反射面：展台面（水平）、背板与玻璃前表面（竖直）。
+
+    每个面记录：法线 normal、粗糙度 roughness、反射率 reflectance，
+    以及用于边界判断的平面锚点 p0、面内主轴 u 与尺寸。
+    """
+    out = []
+    for d in config.get('devices', []):
+        if d.get('type') != 'case':
+            continue
+        rot = d.get('rot', 0)
+        ux, uy = _rot(1, 0, 0, 0, rot)      # 局部 X 轴（世界系）
+        fx, fy = _rot(0, -1, 0, 0, rot)     # 局部 -Y = 展柜正前方
+        w, dd, h = d['w'], d.get('d', 1), d.get('h', 2)
+        name = d.get('name', d['id'])
+        surf = d.get('surf') or {}
+        for plane in ('bottom', 'back', 'glass'):
+            prm = REFL_DEFAULTS[plane]
+            cfg = surf.get(plane) or {}
+            refl = _clamp(float(cfg.get('reflectance', prm['reflectance'])), 0.0, 1.0)
+            rough = _clamp(float(cfg.get('roughness', prm['roughness'])), 0.0, 1.0)
+            if refl <= 0:
+                continue
+            if plane == 'bottom':
+                p0, n = (d['x'], d['y'], 0.1), (0.0, 0.0, 1.0)
+            elif plane == 'back':   # 背板：局部 +d/2 竖直面，法线朝展柜前方
+                p0 = (d['x'] - fx * dd / 2, d['y'] - fy * dd / 2, 0.0)
+                n = (fx, fy, 0.0)
+            else:                   # 玻璃：局部 -d/2 前表面，法线朝外
+                p0 = (d['x'] + fx * dd / 2, d['y'] + fy * dd / 2, 0.0)
+                n = (fx, fy, 0.0)
+            out.append({
+                'id': '%s:%s' % (d['id'], plane), 'owner': d['id'], 'plane': plane,
+                'name': '%s · %s' % (name, PLANE_LABEL[plane]),
+                'p0': p0, 'normal': n, 'u': (ux, uy),
+                'w': w, 'd': dd, 'h': h, 'case': d,
+                'reflectance': refl, 'roughness': rough,
+            })
+    return out
+
+
+def _in_surface(s, H):
+    """命中点 H 是否落在反射面有限边界内。"""
+    if s['plane'] == 'bottom':
+        lx, ly = _to_local(H[0], H[1], s['case'])
+        return abs(lx) <= s['w'] / 2 + 1e-9 and abs(ly) <= s['d'] / 2 + 1e-9
+    lx = (H[0] - s['p0'][0]) * s['u'][0] + (H[1] - s['p0'][1]) * s['u'][1]
+    return abs(lx) <= s['w'] / 2 + 1e-9 and -1e-9 <= H[2] <= s['h'] + 1e-9
+
+
+def camera_model(config):
+    """相机模型：位置 + 朝向（yaw/pitch）+ 焦距 + 画幅 → 视场角。"""
+    cam = config.get('camera')
+    if not cam:
+        return None
+    yaw = math.radians(cam.get('yaw', 90))
+    pitch = math.radians(cam.get('pitch', -8))
+    focal = max(float(cam.get('focal', 35)), 1.0)
+    sw = max(float(cam.get('sensor_w', 36)), 1.0)
+    sh = max(float(cam.get('sensor_h', 24)), 1.0)
+    return {
+        'pos': (cam['x'], cam['y'], cam.get('z', 1.6)),
+        'yaw': yaw, 'pitch': pitch,
+        'fwd_h': (math.cos(yaw), math.sin(yaw), 0.0),
+        'right': (math.sin(yaw), -math.cos(yaw), 0.0),
+        'hfov': math.degrees(2 * math.atan(sw / (2 * focal))),
+        'vfov': math.degrees(2 * math.atan(sh / (2 * focal))),
+        'focal': focal, 'sensor_w': sw, 'sensor_h': sh,
+    }
+
+
+def compute_reflections(config):
+    """镜面反射试排：对每盏灯 × 每个反射面，用镜像法求“灯→面→镜头”光路。
+
+    相机关于反射面的镜像 C' 与灯的连线交反射面于 H，则 L→H→C 满足反射定律；
+    粗糙度转为散射半角估算光斑范围，视场角判断光斑是否入画。
+    """
+    empty = {'camera': None, 'spots': [], 'warnings': [],
+             'summary': {'total': 0, 'in_frame': 0, 'area': 0.0, 'worst': None}}
+    cam = camera_model(config)
+    if not cam:
+        return empty
+    devices = config.get('devices', [])
+    lamps = [d for d in devices if d.get('type') == 'lamp']
+    C = cam['pos']
+    spots = []
+    for s in reflective_surfaces(config):
+        N = s['normal']
+        d_cam = _vdot(_vsub(C, s['p0']), N)
+        if d_cam <= 0.02:
+            continue  # 相机不在反射面前方
+        c_img = (C[0] - 2 * d_cam * N[0], C[1] - 2 * d_cam * N[1], C[2] - 2 * d_cam * N[2])
+        for lamp in lamps:
+            L = (lamp['x'], lamp['y'], lamp.get('z', 3.0))
+            if _vdot(_vsub(L, s['p0']), N) <= 0.0:
+                continue  # 灯在面背后，无一次反射（如柜内灯对玻璃前表面）
+            v = _vsub(L, c_img)
+            denom = _vdot(v, N)
+            if abs(denom) < 1e-9:
+                continue
+            t = _vdot(_vsub(s['p0'], c_img), N) / denom
+            if not 0.0 < t < 1.0:
+                continue
+            H = (c_img[0] + t * v[0], c_img[1] + t * v[1], c_img[2] + t * v[2])
+            if not _in_surface(s, H):
+                continue
+            # 灯→命中点、命中点→镜头两段视线的遮挡
+            pt = {'x': H[0], 'y': H[1], 'z': H[2]}
+            T1 = transmission(lamp, pt, devices, s['owner'])
+            if T1 <= 0:
+                continue
+            T2 = transmission({'x': H[0], 'y': H[1], 'z': H[2]},
+                              {'x': C[0], 'y': C[1], 'z': C[2]}, devices, s['owner'])
+            if T2 <= 0:
+                continue
+            E = lamp_point_E(lamp, pt, N) * T1
+            if E <= 0:
+                continue  # 光束未覆盖命中点，无可视光斑
+            i_dir = _vnorm(_vsub(L, H))
+            r_dir = _vnorm(_vsub(C, H))
+            cos_i = _clamp(_vdot(i_dir, N), 0.0, 1.0)
+            cos_r = _clamp(_vdot(r_dir, N), 0.0, 1.0)
+            inc = math.degrees(math.acos(cos_i))
+            ref = math.degrees(math.acos(cos_r))
+            r1, r2 = _vlen(_vsub(L, H)), _vlen(_vsub(C, H))
+            # 粗糙度 → 散射半角 → 面上光斑半径（镜像模糊近似，掠射方向拉长）
+            alpha = math.radians(0.5 + s['roughness'] * 45.0)
+            r_across = alpha / (1.0 / r1 + 1.0 / r2)
+            r_along = r_across / max(cos_i, 0.2)
+            lim_r = max(s['w'], s['d'], s['h'])
+            r_across = min(r_across, lim_r)
+            r_along = min(r_along, lim_r)
+            surf_area = s['w'] * s['d'] if s['plane'] == 'bottom' else s['w'] * s['h']
+            area = min(math.pi * r_across * r_along, surf_area)
+            # 命中点相对相机光轴的偏轴角 → 是否入画
+            vc = _vsub(H, C)
+            h_ang = math.degrees(math.atan2(_vdot(vc, cam['right']), _vdot(vc, cam['fwd_h'])))
+            v_ang = math.degrees(math.atan2(vc[2], math.hypot(vc[0], vc[1]))) \
+                - math.degrees(cam['pitch'])
+            in_frame = abs(h_ang) <= cam['hfov'] / 2 and abs(v_ang) <= cam['vfov'] / 2
+            severity = E * s['reflectance'] * (1.0 - 0.6 * s['roughness']) * T2
+            # 光斑主轴：入射面方向在水平面的投影（竖直面投影退化，按圆形绘制）
+            if s['plane'] == 'bottom':
+                ax = _vnorm((vc[0], vc[1], 0.0))
+                axis = [round(ax[0], 4), round(ax[1], 4)]
+            else:
+                axis = [0.0, 0.0]
+            spots.append({
+                'id': '%s:%s' % (s['id'], lamp['id']),
+                'lamp_id': lamp['id'], 'lamp_name': lamp.get('name', lamp['id']),
+                'surface_id': s['id'], 'surface_name': s['name'], 'plane': s['plane'],
+                'hit': {'x': round(H[0], 3), 'y': round(H[1], 3), 'z': round(H[2], 3)},
+                'incident_deg': round(inc, 1), 'reflect_deg': round(ref, 1),
+                'reflectance': s['reflectance'], 'roughness': s['roughness'],
+                'normal': [round(N[0], 4), round(N[1], 4), round(N[2], 4)],
+                'E_hit': round(E, 2), 'severity': round(severity, 2),
+                'in_frame': in_frame, 'off_h': round(h_ang, 1), 'off_v': round(v_ang, 1),
+                'spot': {'rx': round(r_along, 3), 'ry': round(r_across, 3),
+                         'axis': axis, 'area': round(area, 3)},
+                'path': {'lamp': {'x': L[0], 'y': L[1], 'z': L[2]},
+                         'hit': {'x': round(H[0], 3), 'y': round(H[1], 3), 'z': round(H[2], 3)},
+                         'cam': {'x': C[0], 'y': C[1], 'z': C[2]}},
+            })
+    spots.sort(key=lambda s: -s['severity'])
+    in_spots = [s for s in spots if s['in_frame']]
+    area_total = round(sum(s['spot']['area'] for s in in_spots), 3)
+    worst = None
+    if in_spots:
+        w0 = max(in_spots, key=lambda s: s['severity'])
+        worst = {'lamp_id': w0['lamp_id'], 'lamp_name': w0['lamp_name'],
+                 'surface_name': w0['surface_name'], 'severity': w0['severity'],
+                 'label': '%s → %s' % (w0['lamp_name'], w0['surface_name'])}
+    warnings = []
+    for s in in_spots[:5]:
+        warnings.append('镜面反射入画：%s 经 %s 进入镜头（入射角 %.1f°，光斑约 %.2f m²）'
+                        % (s['lamp_name'], s['surface_name'], s['incident_deg'], s['spot']['area']))
+    if len(in_spots) > 5:
+        warnings.append('另有 %d 处反射光路入画' % (len(in_spots) - 5))
+    return {
+        'camera': {'hfov': round(cam['hfov'], 1), 'vfov': round(cam['vfov'], 1),
+                   'focal': cam['focal'], 'sensor_w': cam['sensor_w'],
+                   'sensor_h': cam['sensor_h']},
+        'spots': spots,
+        'warnings': warnings,
+        'summary': {'total': len(spots), 'in_frame': len(in_spots),
+                    'area': area_total, 'worst': worst},
+    }
+
+
 def diff_metrics(ma, mb):
     """两套方案指标差异（B 相对 A）。"""
     rows = []
@@ -336,8 +559,20 @@ def diff_metrics(ma, mb):
             mrows.append({'key': k, 'label': label, 'a': sa[k], 'b': sb[k],
                           'd': round(sb[k] - sa[k], 3)})
         rows.append({'surface': sa['name'], 'metrics': mrows})
+    # 反射光斑对照：入画数量、覆盖面积、最严重来源
+    ra = (ma.get('reflections') or {}).get('summary') or {}
+    rb = (mb.get('reflections') or {}).get('summary') or {}
+    refl = {
+        'in_frame': {'a': ra.get('in_frame', 0), 'b': rb.get('in_frame', 0),
+                     'd': rb.get('in_frame', 0) - ra.get('in_frame', 0)},
+        'area': {'a': ra.get('area', 0), 'b': rb.get('area', 0),
+                 'd': round(rb.get('area', 0) - ra.get('area', 0), 3)},
+        'worst': {'a': (ra.get('worst') or {}).get('label') or '—',
+                  'b': (rb.get('worst') or {}).get('label') or '—'},
+    }
     return {
         'surfaces': rows,
         'glare': {'a': ma['glare']['total'], 'b': mb['glare']['total'],
                   'd': round(mb['glare']['total'] - ma['glare']['total'], 2)},
+        'reflections': refl,
     }

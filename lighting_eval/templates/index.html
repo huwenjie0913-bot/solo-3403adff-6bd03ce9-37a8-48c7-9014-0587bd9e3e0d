@@ -16,6 +16,8 @@
     <button id="lockLamps" title="锁定/解锁全部灯位，便于试排其余设备">🔒 全部灯具</button>
     <button id="delSel">删除选中</button>
     <label class="chk"><input type="checkbox" id="showHeat" checked> 热区</label>
+    <label class="chk"><input type="checkbox" id="showFov" checked> 视场</label>
+    <label class="chk"><input type="checkbox" id="showRefl" checked> 反射光路</label>
     <button id="evalNow">重新评估</button>
     <button id="exportSvg">导出 SVG</button>
     <button id="exportJson">导出 JSON</button>
@@ -24,7 +26,7 @@
 <main>
   <section id="canvasWrap">
     <canvas id="plan"></canvas>
-    <div id="hint">滚轮缩放 · 拖空白处平移 · 拖动设备移动 · 点击热区点追溯贡献灯具</div>
+    <div id="hint">滚轮缩放 · 拖空白处平移 · 拖动设备移动 · 点击热区点追溯贡献 · 点击光斑查看反射来源</div>
   </section>
   <aside>
     <div class="panel">
@@ -60,6 +62,10 @@
     <div class="panel">
       <h2>热区追溯</h2>
       <div id="traceBody" class="muted">评估后点击画布中的热区点</div>
+    </div>
+    <div class="panel">
+      <h2>反射光斑</h2>
+      <div id="spotBody" class="muted">评估后点击画布中的光斑（红=入画，灰=视场外）</div>
     </div>
     <div class="panel">
       <h2>方案管理</h2>
