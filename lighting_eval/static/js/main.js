@@ -211,21 +211,28 @@ function drawHeat() {
 }
 
 /* ---------- 拾取 ---------- */
-function pickDevice(wx, wy) {
+// 点状可拖放设备（灯具、相机）：小半径命中
+function pickPointDevice(wx, wy) {
   const cam = state.config.camera;
   if (cam && Math.hypot(wx - cam.x, wy - cam.y) < 0.3) return 'camera';
   const devs = state.config.devices;
   for (let i = devs.length - 1; i >= 0; i--) {
     const d = devs[i];
-    if (d.type === 'lamp') {
-      if (Math.hypot(wx - d.x, wy - d.y) < 0.3) return d;
-    } else {
-      // 变换到局部坐标判断
-      const r = -(d.rot || 0) * Math.PI / 180;
-      const lx = (wx - d.x) * Math.cos(r) - (wy - d.y) * Math.sin(r);
-      const ly = (wx - d.x) * Math.sin(r) + (wy - d.y) * Math.cos(r);
-      if (Math.abs(lx) <= d.w / 2 + 0.1 && Math.abs(ly) <= Math.max(d.d || 0.1, 0.15) / 2 + 0.1) return d;
-    }
+    if (d.type === 'lamp' && Math.hypot(wx - d.x, wy - d.y) < 0.3) return d;
+  }
+  return null;
+}
+
+// 面状容器（展柜、背景）：局部坐标矩形命中
+function pickRectDevice(wx, wy) {
+  const devs = state.config.devices;
+  for (let i = devs.length - 1; i >= 0; i--) {
+    const d = devs[i];
+    if (d.type === 'lamp') continue;
+    const r = -(d.rot || 0) * Math.PI / 180;
+    const lx = (wx - d.x) * Math.cos(r) - (wy - d.y) * Math.sin(r);
+    const ly = (wx - d.x) * Math.sin(r) + (wy - d.y) * Math.cos(r);
+    if (Math.abs(lx) <= d.w / 2 + 0.1 && Math.abs(ly) <= Math.max(d.d || 0.1, 0.15) / 2 + 0.1) return d;
   }
   return null;
 }
@@ -254,20 +261,27 @@ canvas.addEventListener('pointerdown', e => {
     drag = { type: 'pan', sx: e.clientX, sy: e.clientY, ox: state.view.ox, oy: state.view.oy };
     return;
   }
-  const hit = pickDevice(wx, wy);
-  if (hit) {
-    select(hit);
-    const locked = hit !== 'camera' && hit.type === 'lamp' && hit.locked;
+  // 命中优先级：灯具/相机（可拖放） > 网格热区（追溯） > 展柜/背景容器 > 平移
+  const pd = pickPointDevice(wx, wy);
+  if (pd) {
+    select(pd);
+    const locked = pd !== 'camera' && pd.type === 'lamp' && pd.locked;
     if (!locked) {
-      const src = hit === 'camera' ? state.config.camera : hit;
-      drag = { type: 'move', dev: hit, dx: wx - src.x, dy: wy - src.y, moved: false };
+      const src = pd === 'camera' ? state.config.camera : pd;
+      drag = { type: 'move', dev: pd, dx: wx - src.x, dy: wy - src.y, moved: false };
     }
-  } else {
-    const hp = pickHeat(wx, wy);
-    if (hp) { doTrace(hp.surface, hp.index); return; }
-    select(null);
-    drag = { type: 'pan', sx: e.clientX, sy: e.clientY, ox: state.view.ox, oy: state.view.oy };
+    return;
   }
+  const hp = pickHeat(wx, wy);
+  if (hp) { doTrace(hp.surface, hp.index); return; }
+  const rd = pickRectDevice(wx, wy);
+  if (rd) {
+    select(rd);
+    drag = { type: 'move', dev: rd, dx: wx - rd.x, dy: wy - rd.y, moved: false };
+    return;
+  }
+  select(null);
+  drag = { type: 'pan', sx: e.clientX, sy: e.clientY, ox: state.view.ox, oy: state.view.oy };
 });
 
 canvas.addEventListener('pointermove', e => {
