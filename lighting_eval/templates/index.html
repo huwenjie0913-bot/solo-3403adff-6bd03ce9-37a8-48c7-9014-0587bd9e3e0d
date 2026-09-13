@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文物摄影布光评估</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header>
+  <h1>文物摄影布光评估</h1>
+  <div class="toolbar">
+    <button id="addCase">＋展柜</button>
+    <button id="addBg">＋背景</button>
+    <button id="addLamp">＋灯具</button>
+    <button id="lockLamps" title="锁定/解锁全部灯位，便于试排其余设备">🔒 全部灯具</button>
+    <button id="delSel">删除选中</button>
+    <label class="chk"><input type="checkbox" id="showHeat" checked> 热区</label>
+    <button id="evalNow">重新评估</button>
+    <button id="exportSvg">导出 SVG</button>
+    <button id="exportJson">导出 JSON</button>
+  </div>
+</header>
+<main>
+  <section id="canvasWrap">
+    <canvas id="plan"></canvas>
+    <div id="hint">滚轮缩放 · 拖空白处平移 · 拖动设备移动 · 点击热区点追溯贡献灯具</div>
+  </section>
+  <aside>
+    <div class="panel">
+      <h2>全局设置</h2>
+      <div class="grid2">
+        <label>房间宽 (m)<input id="s_roomW" type="number" step="0.5" min="2"></label>
+        <label>房间高 (m)<input id="s_roomH" type="number" step="0.5" min="2"></label>
+        <label>目标照度下限 (lx)<input id="s_tmin" type="number" step="5" min="0"></label>
+        <label>目标照度上限 (lx)<input id="s_tmax" type="number" step="5" min="0"></label>
+        <label>均匀度下限<input id="s_umin" type="number" step="0.05" min="0" max="1"></label>
+        <label>单日照射 (h)<input id="s_hours" type="number" step="0.5" min="0"></label>
+        <label>网格间距 (m)<input id="s_grid" type="number" step="0.05" min="0.05"></label>
+        <label>眩光限值 (lx)<input id="s_glare" type="number" step="1" min="0"></label>
+        <label>光敏度
+          <select id="s_sens">
+            <option value="paper">纸质/高敏 (50 lx)</option>
+            <option value="medium">中敏 (150 lx)</option>
+            <option value="insensitive">低敏 (300 lx)</option>
+          </select>
+        </label>
+        <label>照度阈值 (lx)<input id="s_luxlimit" type="number" step="5" min="0"></label>
+        <label>年剂量阈值 (lx·h)<input id="s_doselimit" type="number" step="10000" min="0"></label>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>设备属性</h2>
+      <div id="propsBody" class="muted">未选中设备（点击画布中的设备）</div>
+    </div>
+    <div class="panel">
+      <h2>评估结果</h2>
+      <div id="resultBody" class="muted">—</div>
+    </div>
+    <div class="panel">
+      <h2>热区追溯</h2>
+      <div id="traceBody" class="muted">评估后点击画布中的热区点</div>
+    </div>
+    <div class="panel">
+      <h2>方案管理</h2>
+      <div class="row">
+        <input id="schemeName" placeholder="方案名称">
+        <button id="saveScheme">保存当前</button>
+      </div>
+      <div id="schemeList"></div>
+      <div class="row cmp">
+        <select id="cmpA"></select>
+        <select id="cmpB"></select>
+        <button id="doCompare">比较</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="overlayToggle"> 在画布上叠加显示方案 B</label>
+      <div id="compareBody"></div>
+    </div>
+  </aside>
+</main>
+<script src="/static/js/main.js"></script>
+</body>
+</html>
